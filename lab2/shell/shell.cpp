@@ -201,7 +201,7 @@ void execute_with_pipe(std::vector<std::string> &args) {
                 // Caveat open with O_CREAT must supply permission code
                 fds_next[1] = open(redir_to.c_str(), oflag, 0644);
                 if (fds_next[1] < 0) {
-                    std::cerr << "open redirection input file failed: " << strerror(errno) << std::endl;
+                    std::cerr << "open redirection output file failed: " << strerror(errno) << std::endl;
                 }
                 close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
             }
