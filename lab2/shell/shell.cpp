@@ -13,6 +13,7 @@
 std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
+void execute_with_pipe_new(std::vector<std::string> &args);
 
 int main() {
     std::ios::sync_with_stdio(false);
@@ -114,18 +115,82 @@ int main() {
         } // exit
 
         // fork_and_exec(args);
-        execute_with_pipe(args);
+        // execute_with_pipe(args);
+        execute_with_pipe_new(args);
+    }
+}
+
+void execute_with_pipe_new(std::vector<std::string> &args) {
+    std::vector<int> cmd_idx;
+    cmd_idx.push_back(0);
+    char *arg_ptrs[args.size() + 1];
+    for (int i = 0; i < args.size(); i++) {
+        if (args[i] == "|") {
+            arg_ptrs[i] = nullptr;
+            cmd_idx.push_back(i + 1);
+        } else {
+            arg_ptrs[i] = &args[i][0];
+        }
+    }
+    arg_ptrs[args.size()] = nullptr;
+    int cmd_count = cmd_idx.size();
+
+    int fds[2] = {0, 1}, fds_next[2] = {0, 1};
+
+    for (int i = 0; i < cmd_count; ++i) {
+        assert(pipe(fds_next) == 0);
+        pid_t pid = fork();
+        if (pid == 0) {
+            close(fds_next[0]);
+            if (i != 0) {
+                close(0); assert(dup(fds[0]) == 0); close(fds[0]);
+            }
+            if (i != cmd_count - 1) {
+                close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
+            }
+            execvp(args[cmd_idx[i]].c_str(), arg_ptrs + cmd_idx[i]);
+            std::cerr << "exec " << i << "th subcommand failed: " << strerror(errno) << '\n';
+            exit(255);
+        }
+        close(fds_next[1]);     // we dont need the write port anymore
+        fds[0] = fds_next[0];   // pass on read port
+    }
+
+    // wait for subprocesses to finish
+    int status;
+    int retpid;
+    while (true) {
+        retpid = wait(&status);
+        if (retpid < 0) {
+            std::cerr << "wait failed: " << strerror(errno) << '\n';
+            return;
+        } else {
+            std::cerr << "wait success\n";
+            if (WIFEXITED(status)) {
+                // child process exited
+                if (WEXITSTATUS(status) == 255) {
+                    std::cerr << "child exec failed.\n";
+                }
+            } else if (WIFSIGNALED(status)) {
+                ;
+            }
+        }
     }
 }
 
 void execute_with_pipe(std::vector<std::string> &args) {
     std::vector<int> cmd_idx;
     cmd_idx.push_back(0);
-    for (int i = 0; i < args.size(); ++i) {
+    char *arg_ptrs[args.size() + 1];
+    for (int i = 0; i < args.size(); i++) {
         if (args[i] == "|") {
+            arg_ptrs[i] = nullptr;
             cmd_idx.push_back(i + 1);
+        } else {
+            arg_ptrs[i] = &args[i][0];
         }
     }
+    arg_ptrs[args.size()] = nullptr;
     cmd_idx.push_back(args.size() + 1);
 
     // (1) setup pipe
@@ -137,31 +202,20 @@ void execute_with_pipe(std::vector<std::string> &args) {
 
     pid_t pid = fork();
 
-    char *arg_ptrs[args.size() + 1];
-    if (pid == 0) {
-        for (int i = cmd_idx[1]; i < cmd_idx[2] - 1; i++)
-            arg_ptrs[i - cmd_idx[1]] = &args[i][0];
-        arg_ptrs[cmd_idx[2] - cmd_idx[1] - 1] = nullptr;
-    } else {
-        for (int i = cmd_idx[0]; i < cmd_idx[1] - 1; i++)
-            arg_ptrs[i - cmd_idx[0]] = &args[i][0];
-        arg_ptrs[cmd_idx[1] - cmd_idx[0] - 1] = nullptr;
-    }
-
     if (pid == 0) {
         // child process, reads
-        close(0);
+        close(0); close(fds[1]);
         assert(dup(fds[0]) == 0);
         close(fds[0]);
-        execvp(args[cmd_idx[1]].c_str(), arg_ptrs);
+        execvp(args[cmd_idx[1]].c_str(), arg_ptrs + cmd_idx[1]);
         std::cout << "exec failed: " << strerror(errno) << '\n';
         exit(255);
     } else {
         // parent process, writes
-        close(1);
+        close(1); close(fds[0]);
         assert(dup(fds[1]) == 1);
         close(fds[1]);
-        execvp(args[cmd_idx[0]].c_str(), arg_ptrs);
+        execvp(args[cmd_idx[0]].c_str(), arg_ptrs + cmd_idx[0]);
         std::cout << "exec failed: " << strerror(errno) << '\n';
         exit(255);
     }
