@@ -4,16 +4,16 @@
 #include <sstream> // std::string 转 int
 #include <climits> // PATH_MAX 等常量
 #include <unistd.h> // POSIX API
+#include <fcntl.h>
 #include <pwd.h>
 #include <sys/wait.h> // wait
 #include <sys/types.h>
 #include <cstring>
-#include <assert.h>
+#include <cassert>
 
 std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
-void execute_with_pipe_new(std::vector<std::string> &args);
 
 int main() {
     std::ios::sync_with_stdio(false);
@@ -115,44 +115,102 @@ int main() {
         } // exit
 
         // fork_and_exec(args);
-        // execute_with_pipe(args);
-        execute_with_pipe_new(args);
+        execute_with_pipe(args);
     }
 }
 
-void execute_with_pipe_new(std::vector<std::string> &args) {
+void execute_with_pipe(std::vector<std::string> &args) {
     std::vector<int> cmd_idx;
     cmd_idx.push_back(0);
     char *arg_ptrs[args.size() + 1];
+    bool first = true, last = false, append = false;
+    std::string redir_from, redir_to;
     for (int i = 0; i < args.size(); i++) {
         if (args[i] == "|") {
+            first = last = append = false;
             arg_ptrs[i] = nullptr;
             cmd_idx.push_back(i + 1);
+        } else if (args[i] == "<") {
+            // read from file
+            // only effective for the first command in the chain
+            arg_ptrs[i] = nullptr;
+            if (!first) { continue; }
+            redir_from = args[i+1]; ++i;        // TODO range check
+        } else if (args[i] == ">") {
+            // write to file
+            // only effective for the last command in the chain
+            arg_ptrs[i] = nullptr;
+            last = true; append = false;
+            redir_to = args[i+1]; ++i;          // TODO range check
+        } else if (args[i] == ">>") {
+            // append to file
+            // only effective for the last command in the chain
+            arg_ptrs[i] = nullptr;
+            last = true; append = true;
+            redir_to = args[i+1]; ++i;          // TODO range check
         } else {
             arg_ptrs[i] = &args[i][0];
         }
     }
     arg_ptrs[args.size()] = nullptr;
     int cmd_count = cmd_idx.size();
+    if (!last) redir_to = "";
+
+// #define DEBUG
+#ifdef DEBUG
+    if (redir_from.length()) {
+        std::cout << "global input file: " << redir_from << std::endl;
+    }
+    for (int i = 0; i < cmd_count; ++i) {
+        std::cout << "cmd #" << i << ": [" << args[cmd_idx[i]];
+        for (int j = cmd_idx[i] + 1; arg_ptrs[j]; ++j) {
+            std::cout << ", " << arg_ptrs[j];
+        }
+        std::cout << "]" << std::endl;
+    }
+    if (redir_to.length()) {
+        std::cout << "global output file: " << redir_to << std::endl;
+    }
+#endif
 
     int fds[2] = {0, 1}, fds_next[2] = {0, 1};
 
     for (int i = 0; i < cmd_count; ++i) {
-        assert(pipe(fds_next) == 0);
+        if (i != cmd_count - 1)
+            assert(pipe(fds_next) == 0);
         pid_t pid = fork();
         if (pid == 0) {
-            close(fds_next[0]);
             if (i != 0) {
+                close(0); assert(dup(fds[0]) == 0); close(fds[0]);
+            } else if (redir_from.length()) {
+                // input redir
+                fds[0] = open(redir_from.c_str(), O_RDONLY);
+                if (fds[0] < 0) {
+                    std::cerr << "open redirection input file failed: " << strerror(errno) << std::endl;
+                    exit(255);
+                }
                 close(0); assert(dup(fds[0]) == 0); close(fds[0]);
             }
             if (i != cmd_count - 1) {
+                close(fds_next[0]);
+                close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
+            } else if (redir_to.length()) {
+                // output redir
+                int oflag = O_WRONLY | O_CREAT;
+                if (append) oflag |= O_APPEND;
+                // Caveat open with O_CREAT must supply permission code
+                fds_next[1] = open(redir_to.c_str(), oflag, 0644);
+                if (fds_next[1] < 0) {
+                    std::cerr << "open redirection input file failed: " << strerror(errno) << std::endl;
+                }
                 close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
             }
             execvp(args[cmd_idx[i]].c_str(), arg_ptrs + cmd_idx[i]);
             std::cerr << "exec " << i << "th subcommand failed: " << strerror(errno) << '\n';
             exit(255);
         }
-        close(fds_next[1]);     // we dont need the write port anymore
+        if (i != cmd_count - 1)
+            close(fds_next[1]); // we dont need the write port anymore
         fds[0] = fds_next[0];   // pass on read port
     }
 
@@ -162,62 +220,10 @@ void execute_with_pipe_new(std::vector<std::string> &args) {
     while (true) {
         retpid = wait(&status);
         if (retpid < 0) {
-            std::cerr << "wait failed: " << strerror(errno) << '\n';
+            // std::cerr << "wait failed: " << strerror(errno) << '\n';
+            // all subprocesses have exited
             return;
-        } else {
-            std::cerr << "wait success\n";
-            if (WIFEXITED(status)) {
-                // child process exited
-                if (WEXITSTATUS(status) == 255) {
-                    std::cerr << "child exec failed.\n";
-                }
-            } else if (WIFSIGNALED(status)) {
-                ;
-            }
         }
-    }
-}
-
-void execute_with_pipe(std::vector<std::string> &args) {
-    std::vector<int> cmd_idx;
-    cmd_idx.push_back(0);
-    char *arg_ptrs[args.size() + 1];
-    for (int i = 0; i < args.size(); i++) {
-        if (args[i] == "|") {
-            arg_ptrs[i] = nullptr;
-            cmd_idx.push_back(i + 1);
-        } else {
-            arg_ptrs[i] = &args[i][0];
-        }
-    }
-    arg_ptrs[args.size()] = nullptr;
-    cmd_idx.push_back(args.size() + 1);
-
-    // (1) setup pipe
-    // (2) replace stdout and stdin (in forked processes)
-    //     by closing stdin/stdout then use dup to occupy lowest fd
-    // (3) exec
-    int fds[2];
-    pipe(fds);      // [read; write]
-
-    pid_t pid = fork();
-
-    if (pid == 0) {
-        // child process, reads
-        close(0); close(fds[1]);
-        assert(dup(fds[0]) == 0);
-        close(fds[0]);
-        execvp(args[cmd_idx[1]].c_str(), arg_ptrs + cmd_idx[1]);
-        std::cout << "exec failed: " << strerror(errno) << '\n';
-        exit(255);
-    } else {
-        // parent process, writes
-        close(1); close(fds[0]);
-        assert(dup(fds[1]) == 1);
-        close(fds[1]);
-        execvp(args[cmd_idx[0]].c_str(), arg_ptrs + cmd_idx[0]);
-        std::cout << "exec failed: " << strerror(errno) << '\n';
-        exit(255);
     }
 }
 
