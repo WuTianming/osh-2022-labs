@@ -12,6 +12,7 @@
 
 #include <pwd.h>
 #include <fcntl.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <unistd.h>
 #include <termios.h>
@@ -26,6 +27,7 @@ std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
 
+sigjmp_buf ctrlc_buf;
 static void sigintHandler(int sig) {
     // Ctrl-C sends SIGINT to the whole process group
     // bash 处理 Ctrl-C 的方法是让子进程 setpgid 脱离进程组。
@@ -36,7 +38,12 @@ static void sigintHandler(int sig) {
     // and continue for new loop
     // Caveat C++ library routines are usually OS-agnostic,
     //        thus will mask the effect of EINTR
-    write(STDERR_FILENO, "Caught SIGINT!\n", 15);
+    // write(STDERR_FILENO, "Caught SIGINT!\n", 15);
+    if (sig == SIGINT) {
+        // printf("You pressed Ctrl+C\n");
+        write(STDERR_FILENO, "\n", 1);
+        siglongjmp(ctrlc_buf, 1);
+    }
 }
 
 int main() {
@@ -63,7 +70,8 @@ int main() {
 
         // Caveat C++ library routines mask EINTR
         // had to resort to GNU readline
-        std::cout << std::flush;            // refrain from flushing everytime (std::endl)
+        while (sigsetjmp(ctrlc_buf, 1) != 0);   // copied from stackoverflow https://stackoverflow.com/questions/16828378/readline-get-a-new-prompt-on-sigint
+        std::cout << std::flush;                // refrain from flushing everytime (std::endl)
         char* line = readline(uid ? "$ " : "# ");
         if (line == nullptr) cmd = "exit";
         else cmd = line;
