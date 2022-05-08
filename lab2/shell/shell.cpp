@@ -6,6 +6,8 @@
 #include <climits> // PATH_MAX 等常量
 #include <unistd.h> // POSIX API
 #include <fcntl.h>
+#include <signal.h>
+#include <termios.h>
 #include <pwd.h>
 #include <sys/wait.h> // wait
 #include <sys/types.h>
@@ -16,8 +18,25 @@ std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
 
+static void sigintHandler(int sig) {
+    // Ctrl-C sends SIGINT to the whole process group
+    // bash 处理 Ctrl-C 的方法是让子进程 setpgid 脱离进程组。
+    // see: SETPGID(2), TCSETPGRP(3)
+    // the subprocess should receive SIGINT as usual
+    // the shell should wait for the subprocess to end
+    // and continue for new loop
+    // Caveat glibc implementation retries on EINTR, no good
+    write(STDERR_FILENO, "Caught SIGINT!\n", 15);
+}
+
 int main() {
     std::ios::sync_with_stdio(false);
+
+    if (signal(SIGINT, sigintHandler) == SIG_ERR) {
+        std::cerr << "cannot set SIGINT handler" << std::endl;
+        exit(1);
+    }
+
     uid_t uid = getuid();
     struct passwd *pw = getpwuid(uid);
     const char *homedir = pw->pw_dir;
@@ -121,6 +140,12 @@ int main() {
 }
 
 void execute_with_pipe(std::vector<std::string> &args) {
+    // struct termios settings;
+    // if (tcgetattr(STDIN_FILENO, &settings) < 0) {
+    //     perror("error in tcgetattr");
+    //     exit(255);
+    // }
+
     std::vector<int> cmd_idx;
     cmd_idx.push_back(0);
     char *arg_ptrs[args.size() + 1];
@@ -205,11 +230,15 @@ void execute_with_pipe(std::vector<std::string> &args) {
 
     int fds[2] = {0, 1}, fds_next[2] = {0, 1};
 
+    bool first_process = true;
+    pid_t leader_pid = 0;
     for (int i = 0; i < cmd_count; ++i) {
         if (i != cmd_count - 1)
             assert(pipe(fds_next) == 0);
         pid_t pid = fork();
         if (pid == 0) {
+            if (first_process) leader_pid = getpid();
+            setpgid(0, leader_pid);
             if (i != 0) {
                 close(0); assert(dup(fds[0]) == 0); close(fds[0]);
             } else if (redir_from.size()) {
@@ -247,6 +276,15 @@ void execute_with_pipe(std::vector<std::string> &args) {
             std::cerr << "exec " << i << "th subcommand failed: " << strerror(errno) << '\n';
             exit(255);
         }
+        if (first_process) {
+            leader_pid = pid;
+        }
+        setpgid(pid, leader_pid);       // the parent calls setpgid again to avoid timing problems
+        if (first_process) {
+            tcsetpgrp(STDIN_FILENO, leader_pid);
+            kill(pid, SIGCONT);         // mitigate race
+            first_process = false;
+        }
         if (i != cmd_count - 1)
             close(fds_next[1]); // we dont need the write port anymore
         fds[0] = fds_next[0];   // pass on read port
@@ -254,15 +292,15 @@ void execute_with_pipe(std::vector<std::string> &args) {
 
     // wait for subprocesses to finish
     int status;
-    int retpid;
-    while (true) {
-        retpid = wait(&status);
-        if (retpid < 0) {
-            // std::cerr << "wait failed: " << strerror(errno) << '\n';
-            // all subprocesses have exited
-            return;
-        }
+    while (wait(&status) >= 0);
+    signal(SIGTTOU, SIG_IGN);
+    if (tcsetpgrp(STDIN_FILENO, getpgid(getpid())) < 0) {
+        // 不过好像这里设置前台失败的话，怎么输出错误信息都是没法看到的吧……
+        std::cerr << "set oneself as foreground process group failed: " << strerror(errno) << std::endl;
+        exit(255);
     }
+    signal(SIGTTOU, SIG_DFL);
+    // tcsetattr(STDIN_FILENO, TCSAFLUSH, &settings);
 }
 
 void fork_and_exec(std::vector<std::string> &args) {
@@ -298,6 +336,7 @@ void fork_and_exec(std::vector<std::string> &args) {
 // https://stackoverflow.com/a/14266139/11691878
 std::vector<std::string> split(std::string s, const std::string &delimiter) {
     std::vector<std::string> res;
+    if (s.length() == 0) return res;
     size_t pos = 0;
     std::string token;
     while ((pos = s.find(delimiter)) != std::string::npos) {
