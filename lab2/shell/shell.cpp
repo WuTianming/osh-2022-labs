@@ -1,6 +1,7 @@
 #include <iostream> // IO
 #include <string> // std::string
 #include <vector> // std::vector
+#include <map>
 #include <sstream> // std::string 转 int
 #include <climits> // PATH_MAX 等常量
 #include <unistd.h> // POSIX API
@@ -123,43 +124,71 @@ void execute_with_pipe(std::vector<std::string> &args) {
     std::vector<int> cmd_idx;
     cmd_idx.push_back(0);
     char *arg_ptrs[args.size() + 1];
-    bool first = true, last = false, append = false;
-    std::string redir_from, redir_to;
+    bool first = true, last = false;
+    std::map<int, std::string> redir_from, redir_to;
+    std::map<int, bool> append;
     for (int i = 0; i < args.size(); i++) {
+        int len = args[i].length();
         if (args[i] == "|") {
-            first = last = append = false;
+            first = last = false;
+            append.clear();
+            redir_to.clear();
             arg_ptrs[i] = nullptr;
             cmd_idx.push_back(i + 1);
-        } else if (args[i] == "<") {
-            // read from file
-            // only effective for the first command in the chain
+        } else if (args[i][len - 1] == '<' || args[i][len - 1] == '>') {
             arg_ptrs[i] = nullptr;
-            if (!first) { continue; }
-            redir_from = args[i+1]; ++i;        // TODO range check
-        } else if (args[i] == ">") {
-            // write to file
-            // only effective for the last command in the chain
-            arg_ptrs[i] = nullptr;
-            last = true; append = false;
-            redir_to = args[i+1]; ++i;          // TODO range check
-        } else if (args[i] == ">>") {
-            // append to file
-            // only effective for the last command in the chain
-            arg_ptrs[i] = nullptr;
-            last = true; append = true;
-            redir_to = args[i+1]; ++i;          // TODO range check
+            bool error = false;
+            int fildes;
+            char *endpos = nullptr;
+            fildes = strtol(args[i].c_str(), &endpos, 10);
+            if (endpos == &args[i][0] + len - 1) {
+                if (*endpos == '<') {
+                    // read from file
+                    // only effective for the first command in the chain
+                    if (!first) { continue; }
+                    if (endpos == &args[i][0]) fildes = 0;
+                    redir_from[fildes] = args[i+1]; ++i;
+                    // TODO range check
+                } else if (*endpos == '>') {
+                    // write to file
+                    // only effective for the last command in the chain
+                    if (endpos == &args[i][0]) fildes = 1;
+                    last = true; append[fildes] = 0;
+                    redir_to[fildes] = args[i+1]; ++i;
+                    // TODO range check
+                } else {
+                    error = true;
+                }
+            } else if (endpos == &args[i][0] + len - 2) {
+                if (*endpos == '>' && *(endpos + 1) == '>') {
+                    // append to file
+                    // only effective for the last command in the chain
+                    if (endpos == &args[i][0]) fildes = 1;
+                    last = true; append[fildes] = 1;
+                    redir_to[fildes] = args[i+1]; ++i;
+                    // TODO range check
+                } else {
+                    error = true;
+                }
+            } else {
+                error = true;
+            }
+            if (error) {
+                std::cerr << "parsing redirection failed" << std::endl;
+            }
         } else {
             arg_ptrs[i] = &args[i][0];
         }
     }
     arg_ptrs[args.size()] = nullptr;
     int cmd_count = cmd_idx.size();
-    if (!last) redir_to = "";
+    if (!last) redir_to.clear();
 
-// #define DEBUG
+#define DEBUG
 #ifdef DEBUG
-    if (redir_from.length()) {
-        std::cout << "global input file: " << redir_from << std::endl;
+    if (redir_from.size()) {
+        for (auto p : redir_from)
+            std::cout << "#" << p.first << " input file: " << p.second << std::endl;
     }
     for (int i = 0; i < cmd_count; ++i) {
         std::cout << "cmd #" << i << ": [" << args[cmd_idx[i]];
@@ -168,8 +197,9 @@ void execute_with_pipe(std::vector<std::string> &args) {
         }
         std::cout << "]" << std::endl;
     }
-    if (redir_to.length()) {
-        std::cout << "global output file: " << redir_to << std::endl;
+    if (redir_to.size()) {
+        for (auto p : redir_to)
+            std::cout << "#" << p.first << " output file: " << p.second << std::endl;
     }
 #endif
 
@@ -182,28 +212,36 @@ void execute_with_pipe(std::vector<std::string> &args) {
         if (pid == 0) {
             if (i != 0) {
                 close(0); assert(dup(fds[0]) == 0); close(fds[0]);
-            } else if (redir_from.length()) {
+            } else if (redir_from.size()) {
                 // input redir
-                fds[0] = open(redir_from.c_str(), O_RDONLY);
-                if (fds[0] < 0) {
-                    std::cerr << "open redirection input file failed: " << strerror(errno) << std::endl;
-                    exit(255);
+                for (std::pair<int, std::string> rfile : redir_from) {
+                    fds[0] = open(rfile.second.c_str(), O_RDONLY);
+                    if (fds[0] < 0) {
+                        std::cerr << "open redirection input file failed: " << strerror(errno) << std::endl;
+                        exit(255);
+                    }
+                    close(rfile.first); assert(dup(fds[0]) == rfile.first); close(fds[0]);
                 }
-                close(0); assert(dup(fds[0]) == 0); close(fds[0]);
             }
             if (i != cmd_count - 1) {
                 close(fds_next[0]);
                 close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
-            } else if (redir_to.length()) {
+            } else if (redir_to.size()) {
                 // output redir
                 int oflag = O_WRONLY | O_CREAT;
-                if (append) oflag |= O_APPEND;
+                int aflag = O_WRONLY | O_CREAT | O_APPEND;
                 // Caveat open with O_CREAT must supply permission code
-                fds_next[1] = open(redir_to.c_str(), oflag, 0644);
-                if (fds_next[1] < 0) {
-                    std::cerr << "open redirection output file failed: " << strerror(errno) << std::endl;
+                for (std::pair<int, std::string> wfile : redir_to) {
+                    fds_next[1] =
+                        open(wfile.second.c_str(),
+                             append[wfile.first] ? aflag : oflag,
+                             0644);
+                    if (fds_next[1] < 0) {
+                        std::cerr << "open redirection output file failed: " << strerror(errno) << std::endl;
+                        exit(255);
+                    }
+                    close(wfile.first); assert(dup(fds_next[1]) == wfile.first); close(fds_next[1]);
                 }
-                close(1); assert(dup(fds_next[1]) == 1); close(fds_next[1]);
             }
             execvp(args[cmd_idx[i]].c_str(), arg_ptrs + cmd_idx[i]);
             std::cerr << "exec " << i << "th subcommand failed: " << strerror(errno) << '\n';
