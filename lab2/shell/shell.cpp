@@ -1,19 +1,27 @@
-#include <iostream> // IO
-#include <string> // std::string
-#include <vector> // std::vector
 #include <map>
-#include <sstream> // std::string 转 int
-#include <climits> // PATH_MAX 等常量
-#include <unistd.h> // POSIX API
+#include <string>
+#include <vector>
+
+#include <sstream>
+#include <iostream>
+
+#include <cctype>
+#include <cassert>
+#include <climits>
+#include <cstring>
+
+#include <pwd.h>
 #include <fcntl.h>
 #include <signal.h>
+#include <unistd.h>
 #include <termios.h>
-#include <pwd.h>
-#include <sys/wait.h> // wait
+#include <sys/wait.h>
 #include <sys/types.h>
-#include <cstring>
-#include <cassert>
 
+#include <readline/readline.h>  // for GNU Readline
+#include <readline/history.h>
+
+std::string sanitize(std::string);
 std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
@@ -22,17 +30,25 @@ static void sigintHandler(int sig) {
     // Ctrl-C sends SIGINT to the whole process group
     // bash 处理 Ctrl-C 的方法是让子进程 setpgid 脱离进程组。
     // see: SETPGID(2), TCSETPGRP(3)
+    // see: https://unix.stackexchange.com/questions/500922/how-ctrl-c-is-working-inside-the-shell
     // the subprocess should receive SIGINT as usual
     // the shell should wait for the subprocess to end
     // and continue for new loop
-    // Caveat glibc implementation retries on EINTR, no good
+    // Caveat C++ library routines are usually OS-agnostic,
+    //        thus will mask the effect of EINTR
     write(STDERR_FILENO, "Caught SIGINT!\n", 15);
 }
 
 int main() {
     std::ios::sync_with_stdio(false);
 
-    if (signal(SIGINT, sigintHandler) == SIG_ERR) {
+    struct sigaction new_action, old_action;
+    sigaction(SIGINT, NULL, &old_action);
+    old_action.sa_flags &= ~SA_RESTART;     // make getline fail with EINTR on SIGINT
+    old_action.sa_handler = sigintHandler;
+
+    // if (signal(SIGINT, sigintHandler) == SIG_ERR) {
+    if (sigaction(SIGINT, &old_action, NULL) < 0) {
         std::cerr << "cannot set SIGINT handler" << std::endl;
         exit(1);
     }
@@ -43,19 +59,21 @@ int main() {
 
     std::string cmd;
     while (true) {
-        std::cout << (uid ? "$ " : "# ") << std::flush;
+        // std::cout << (uid ? "$ " : "# ") << std::flush;
 
-        // 读入一行。std::getline 结果不包含换行符。
-        std::getline(std::cin, cmd);
-        if (std::cin.eof()) {
-            cmd = "exit";
-        }
+        // Caveat C++ library routines mask EINTR
+        // had to resort to GNU readline
+        std::cout << std::flush;            // refrain from flushing everytime (std::endl)
+        char* line = readline(uid ? "$ " : "# ");
+        if (line == nullptr) cmd = "exit";
+        else cmd = line;
+        add_history(cmd.c_str());
 
         // 按空格分割命令为单词
-        // 可以考虑写写 escape magic
+        // TODO 可以考虑写写 escape magic
         // example: echo "qwq qwq"|lolcat  ==>  echo, qwq qwq, |, lolcat
         // std::vector<std::string> args = magic_split(cmd);
-        std::vector<std::string> args = split(cmd, " ");
+        std::vector<std::string> args = split(sanitize(cmd), " ");
 
         if (args.empty()) {
             continue;
@@ -153,15 +171,15 @@ void execute_with_pipe(std::vector<std::string> &args) {
     std::map<int, std::string> redir_from, redir_to;
     std::map<int, bool> append;
     for (int i = 0; i < args.size(); i++) {
+        arg_ptrs[i] = nullptr;
         int len = args[i].length();
+        if (!len) continue;
         if (args[i] == "|") {
             first = last = false;
             append.clear();
             redir_to.clear();
-            arg_ptrs[i] = nullptr;
             cmd_idx.push_back(i + 1);
         } else if (args[i][len - 1] == '<' || args[i][len - 1] == '>') {
-            arg_ptrs[i] = nullptr;
             bool error = false;
             int fildes;
             char *endpos = nullptr;
@@ -209,7 +227,7 @@ void execute_with_pipe(std::vector<std::string> &args) {
     int cmd_count = cmd_idx.size();
     if (!last) redir_to.clear();
 
-#define DEBUG
+// #define DEBUG
 #ifdef DEBUG
     if (redir_from.size()) {
         for (auto p : redir_from)
@@ -330,6 +348,18 @@ void fork_and_exec(std::vector<std::string> &args) {
     } else if (WIFSIGNALED(status)) {
         ;
     }
+}
+
+std::string sanitize(std::string in) {
+    // remove duplicate spaces
+    std::string ret;
+    if (!in.length()) return ret;
+    ret.push_back(in[0]);
+    for (int i = 1; i < in.length(); ++i) {
+        if (isspace(in[i - 1]) && isspace(in[i])) continue;
+        ret.push_back(in[i]);
+    }
+    return ret;
 }
 
 // 经典的 cpp string split 实现
