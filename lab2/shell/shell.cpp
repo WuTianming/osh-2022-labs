@@ -23,6 +23,7 @@
 #include <readline/history.h>
 
 std::string sanitize(std::string);
+std::string expand_hist(std::string);
 std::vector<std::string> split(std::string s, const std::string &delimiter);
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
@@ -64,12 +65,17 @@ int main() {
     struct passwd *pw = getpwuid(uid);
     const char *homedir = pw->pw_dir;
 
+    using_history();
+
+    read_history("myshell_histfile");
+
     std::string cmd;
     while (true) {
         // std::cout << (uid ? "$ " : "# ") << std::flush;
 
         // Caveat C++ library routines mask EINTR
         // had to resort to GNU readline
+        // longjmp is dirty, but ... well, ok
         while (sigsetjmp(ctrlc_buf, 1) != 0);   // copied from stackoverflow https://stackoverflow.com/questions/16828378/readline-get-a-new-prompt-on-sigint
         std::cout << std::flush;                // refrain from flushing everytime (std::endl)
         char* line = readline(uid ? "$ " : "# ");
@@ -81,7 +87,7 @@ int main() {
         // TODO 可以考虑写写 escape magic
         // example: echo "qwq qwq"|lolcat  ==>  echo, qwq qwq, |, lolcat
         // std::vector<std::string> args = magic_split(cmd);
-        std::vector<std::string> args = split(sanitize(cmd), " ");
+        std::vector<std::string> args = split(expand_hist(sanitize(cmd)), " ");
 
         if (args.empty()) {
             continue;
@@ -141,7 +147,26 @@ int main() {
             continue;
         } // export
 
+        if (args[0] == "history") {
+            int idx = 0;
+            if (args.size() <= 1) {
+                // show all history
+                idx = history_length;
+            } else {
+                idx = atoi(args[1].c_str());    // no error checking, sorry xD
+            }
+            HIST_ENTRY **histptr = history_list();
+            for (int i = history_length - idx; i < history_length; ++i) {
+                printf("%5d  %s\n", i+history_base, histptr[i]->line);
+            }
+            continue;
+        }
+
         if (args[0] == "exit") {
+            if (write_history("myshell_histfile") != 0) {
+                perror("cannot write history file");
+            }
+
             if (args.size() <= 1) {
                 return 0;
             }
@@ -358,14 +383,55 @@ void fork_and_exec(std::vector<std::string> &args) {
     }
 }
 
+// remove duplicate spaces
 std::string sanitize(std::string in) {
-    // remove duplicate spaces
     std::string ret;
+    while (in.length() && isspace(in[0]))
+        in = in.substr(1);
     if (!in.length()) return ret;
     ret.push_back(in[0]);
     for (int i = 1; i < in.length(); ++i) {
         if (isspace(in[i - 1]) && isspace(in[i])) continue;
         ret.push_back(in[i]);
+    }
+    return ret;
+}
+
+std::string expand_hist(std::string in) {
+    if (in.length() <= 1) return in;
+    std::string ret;
+    // use a state machine to do the substitution...
+    char prev = '\0';
+    bool in_number = false;
+    int now_number = 0;
+    for (int i = 0; i < in.length(); ++i) {
+        if (in_number) {
+            if (in[i] == '!') {
+                // '!!' combination
+                in_number = false;
+                ret.append(history_get(history_length - 1)->line);
+            } else if (isdigit(in[i])) {
+                now_number = now_number * 10 + (in[i] - '0');
+            } else {
+                ret.append(history_get(now_number)->line);
+                ret.push_back(in[i]);
+                in_number = false;
+            }
+        } else {
+            if (in[i] == '!') {
+                in_number = true;
+                now_number = 0;
+            } else {
+                ret.push_back(in[i]);
+            }
+        }
+    }
+    if (in_number) {
+        if (in[in.length() - 1] == '!') {
+            ret.push_back('!');
+        } else {
+            ret.append(history_get(now_number)->line);
+        }
     }
     return ret;
 }
