@@ -97,6 +97,7 @@ int main() {
         // longjmp is dirty, but ... well, ok
         while (sigsetjmp(ctrlc_buf, 1) != 0);   // copied from stackoverflow https://stackoverflow.com/questions/16828378/readline-get-a-new-prompt-on-sigint
         std::cout << std::flush;                // refrain from flushing everytime (std::endl)
+        current_position_in_history = history_lines.size();
         char* line = readline(uid ? "$ " : "# ");
         if (line == nullptr) cmd = "exit";
         else cmd = line;
@@ -106,7 +107,6 @@ int main() {
         add_history(cmd.c_str());
 #else
         history_lines.push_back(cmd);
-        current_position_in_history = history_lines.size();
 #endif
 
         // 按空格分割命令为单词
