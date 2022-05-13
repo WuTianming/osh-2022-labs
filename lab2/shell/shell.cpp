@@ -446,7 +446,7 @@ std::string expand_hist(std::string in) {
 #ifndef USE_CUSTOM_HISTORY
                 ret.append(history_get(now_number)->line);
 #else
-                ret.append(history_lines[now_number]);
+                ret.append(history_lines[now_number - 1]);
 #endif
                 ret.push_back(in[i]);
                 in_number = false;
