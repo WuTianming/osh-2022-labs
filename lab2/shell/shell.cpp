@@ -1,7 +1,10 @@
+#define USE_CUSTOM_HISTORY
+
 #include <map>
 #include <string>
 #include <vector>
 
+#include <fstream>
 #include <sstream>
 #include <iostream>
 
@@ -20,11 +23,23 @@
 #include <sys/types.h>
 
 #include <readline/readline.h>  // for GNU Readline
-#include <readline/history.h>
+
+#ifndef USE_CUSTOM_HISTORY
+#include <readline/history.h>   // for GNU history
+#else
+std::vector<std::string> history_lines;
+int current_position_in_history = 0;
+void my_readhist(const char *fname);
+int my_writehist(const char *fname);
+int arrow_function(int, int);
+int arrow_function(int, int);
+#endif
+
+std::string expand_hist(std::string);
 
 std::string sanitize(std::string);
-std::string expand_hist(std::string);
 std::vector<std::string> split(std::string s, const std::string &delimiter);
+
 void fork_and_exec(std::vector<std::string> &args);
 void execute_with_pipe(std::vector<std::string> &args);
 
@@ -55,7 +70,6 @@ int main() {
     old_action.sa_flags &= ~SA_RESTART;     // make getline fail with EINTR on SIGINT
     old_action.sa_handler = sigintHandler;
 
-    // if (signal(SIGINT, sigintHandler) == SIG_ERR) {
     if (sigaction(SIGINT, &old_action, NULL) < 0) {
         std::cerr << "cannot set SIGINT handler" << std::endl;
         exit(1);
@@ -65,9 +79,14 @@ int main() {
     struct passwd *pw = getpwuid(uid);
     const char *homedir = pw->pw_dir;
 
+#ifndef USE_CUSTOM_HISTORY
     using_history();
-
     read_history("myshell_histfile");
+#else
+    rl_bind_keyseq("\\e[A", arrow_function);
+    rl_bind_keyseq("\\e[B", arrow_function);
+    my_readhist("myshell_histfile");
+#endif
 
     std::string cmd;
     while (true) {
@@ -81,13 +100,20 @@ int main() {
         char* line = readline(uid ? "$ " : "# ");
         if (line == nullptr) cmd = "exit";
         else cmd = line;
+
+        cmd = expand_hist(sanitize(cmd));
+#ifndef USE_CUSTOM_HISTORY
         add_history(cmd.c_str());
+#else
+        history_lines.push_back(cmd);
+        current_position_in_history = history_lines.size();
+#endif
 
         // 按空格分割命令为单词
         // TODO 可以考虑写写 escape magic
         // example: echo "qwq qwq"|lolcat  ==>  echo, qwq qwq, |, lolcat
         // std::vector<std::string> args = magic_split(cmd);
-        std::vector<std::string> args = split(expand_hist(sanitize(cmd)), " ");
+        std::vector<std::string> args = split(cmd, " ");
 
         if (args.empty()) {
             continue;
@@ -102,7 +128,7 @@ int main() {
 
             int ret = chdir(args[1].c_str());
             if (ret < 0) {
-                std::cout << "cd failed: " << strerror(errno) << '\n';
+                std::cerr << "cd failed: " << strerror(errno) << '\n';
             }
             continue;
         } // cd
@@ -151,19 +177,33 @@ int main() {
             int idx = 0;
             if (args.size() <= 1) {
                 // show all history
+#ifndef USE_CUSTOM_HISTORY
                 idx = history_length;
+#else
+                idx = history_lines.size();
+#endif
             } else {
                 idx = atoi(args[1].c_str());    // no error checking, sorry xD
             }
+#ifndef USE_CUSTOM_HISTORY
             HIST_ENTRY **histptr = history_list();
             for (int i = history_length - idx; i < history_length; ++i) {
                 printf("%5d  %s\n", i+history_base, histptr[i]->line);
             }
+#else
+            for (int i = history_lines.size() - idx; i < history_lines.size(); ++i) {
+                printf("%5d  %s\n", i+1, history_lines[i].c_str());
+            }
+#endif
             continue;
         }
 
         if (args[0] == "exit") {
+#ifndef USE_CUSTOM_HISTORY
             if (write_history("myshell_histfile") != 0) {
+#else
+            if (my_writehist("myshell_histfile") != 0) {
+#endif
                 perror("cannot write history file");
             }
 
@@ -365,14 +405,14 @@ void fork_and_exec(std::vector<std::string> &args) {
 
     if (pid == 0) {
         execvp(args[0].c_str(), arg_ptrs);
-        std::cout << "exec failed: " << strerror(errno) << '\n';
+        std::cerr << "exec failed: " << strerror(errno) << '\n';
         exit(255);
     }
 
     int status;
     int retpid = wait(&status);
     if (retpid < 0) {
-        std::cout << "wait failed: " << strerror(errno) << '\n';
+        std::cerr << "wait failed: " << strerror(errno) << '\n';
     } else if (WIFEXITED(status)) {
         // child process exited
         if (WEXITSTATUS(status) == 255) {
@@ -381,20 +421,6 @@ void fork_and_exec(std::vector<std::string> &args) {
     } else if (WIFSIGNALED(status)) {
         ;
     }
-}
-
-// remove duplicate spaces
-std::string sanitize(std::string in) {
-    std::string ret;
-    while (in.length() && isspace(in[0]))
-        in = in.substr(1);
-    if (!in.length()) return ret;
-    ret.push_back(in[0]);
-    for (int i = 1; i < in.length(); ++i) {
-        if (isspace(in[i - 1]) && isspace(in[i])) continue;
-        ret.push_back(in[i]);
-    }
-    return ret;
 }
 
 std::string expand_hist(std::string in) {
@@ -409,11 +435,19 @@ std::string expand_hist(std::string in) {
             if (in[i] == '!') {
                 // '!!' combination
                 in_number = false;
+#ifndef USE_CUSTOM_HISTORY
                 ret.append(history_get(history_length - 1)->line);
+#else
+                ret.append(*history_lines.rbegin());
+#endif
             } else if (isdigit(in[i])) {
                 now_number = now_number * 10 + (in[i] - '0');
             } else {
+#ifndef USE_CUSTOM_HISTORY
                 ret.append(history_get(now_number)->line);
+#else
+                ret.append(history_lines[now_number]);
+#endif
                 ret.push_back(in[i]);
                 in_number = false;
             }
@@ -430,8 +464,28 @@ std::string expand_hist(std::string in) {
         if (in[in.length() - 1] == '!') {
             ret.push_back('!');
         } else {
+#ifndef USE_CUSTOM_HISTORY
             ret.append(history_get(now_number)->line);
+#else
+            ret.append(history_lines[now_number]);
+#endif
         }
+    }
+    return ret;
+}
+
+// remove duplicate spaces
+std::string sanitize(std::string in) {
+    std::string ret;
+    while (in.length() && isspace(in[0]))
+        in = in.substr(1);
+    while (in.length() && isspace(*in.rbegin()))
+        in.erase(in.size() - 1);
+    if (!in.length()) return ret;
+    ret.push_back(in[0]);
+    for (int i = 1; i < in.length(); ++i) {
+        if (isspace(in[i - 1]) && isspace(in[i])) continue;
+        ret.push_back(in[i]);
     }
     return ret;
 }
@@ -450,4 +504,44 @@ std::vector<std::string> split(std::string s, const std::string &delimiter) {
     }
     res.push_back(s);
     return res;
+}
+
+int arrow_function(int p, int q) {
+    if (q == 'A') {
+        // up arrow
+        if (current_position_in_history != 0) {
+            rl_delete_text(0, rl_end);
+            rl_point = 0;
+            current_position_in_history--;
+            rl_insert_text(history_lines[current_position_in_history].c_str());
+        }
+    } else {
+        // down arrow
+        if (current_position_in_history < history_lines.size() - 1) {
+            rl_delete_text(0, rl_end);
+            rl_point = 0;
+            current_position_in_history++;
+            rl_insert_text(history_lines[current_position_in_history].c_str());
+        }
+    }
+    return 0;
+}
+
+void my_readhist(const char *fname) {
+    std::ifstream fin(fname);
+    std::string str;
+    if (!fin) return;
+    while (std::getline(fin, str)) {
+        history_lines.push_back(str);
+    }
+    current_position_in_history = history_lines.size();
+}
+
+int my_writehist(const char *fname) {
+    std::ofstream fout(fname);
+    if (!fout) return -1;
+    for (auto s : history_lines) {
+        fout << s << std::endl;
+    }
+    return 0;
 }
