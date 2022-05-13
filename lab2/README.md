@@ -32,4 +32,4 @@ Bash 等 Shell 处理 Ctrl-C 实际上是通过将子进程与 Shell 进程自�
 
 ## strace
 
-**TODO**
+实现了必做部分：能够追踪 syscall。
