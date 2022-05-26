@@ -1,4 +1,7 @@
-all: 1
+all: 1 2
+
+2: 2.cpp
+	g++ 2.cpp -o 2 -lpthread
 
 1: 1.c
 	gcc 1.c -o 1 -lpthread
