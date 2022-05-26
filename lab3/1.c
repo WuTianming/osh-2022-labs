@@ -11,12 +11,24 @@ struct Pipe {
     int fd_recv;
 };
 
+// Pipe echoer
 void *handle_chat(void *data) {
     struct Pipe *pipe = (struct Pipe *)data;
-    char buffer[1024] = "Message: ";
     ssize_t len;
-    while ((len = recv(pipe->fd_send, buffer + 8, 1000, 0)) > 0) {
-        send(pipe->fd_recv, buffer, len + 8, 0);
+    char header[] = "Message: ";
+    char recvbuffer[1024];
+    while ((len = recv(pipe->fd_send, recvbuffer, 1000, 0)) > 0) {
+        for (size_t idx = 0, prev = 0; idx < len; ++idx) {
+            if (recvbuffer[idx] == '\n') {
+                char tmp = recvbuffer[idx+1];
+                recvbuffer[idx+1] = '\0';
+                send(pipe->fd_recv, header, 9, 0);
+                send(pipe->fd_recv, recvbuffer + prev, idx - prev + 1, 0);
+                recvbuffer[idx+1] = tmp;
+
+                prev = idx + 1;
+            }
+        }
     }
     return NULL;
 }
