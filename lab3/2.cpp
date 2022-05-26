@@ -3,7 +3,6 @@
 #include <cstdlib>
 #include <queue>
 #include <list>
-#include <memory>       // for shared pointers
 #include <unistd.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
