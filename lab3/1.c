@@ -11,23 +11,39 @@ struct Pipe {
     int fd_recv;
 };
 
+void my_bulk_send(int fd, const void *buf, size_t n, int flags) {
+    size_t sent = 0;
+    while (sent < n)
+        sent += send(fd, buf + sent, n - sent, flags);
+}
+
 // Pipe echoer
 void *handle_chat(void *data) {
     struct Pipe *pipe = (struct Pipe *)data;
     ssize_t len;
+#ifdef RAW_BINARY_TRANSFER
+    char header[] = "";
+    char footer[] = "";
+#else
     char header[] = "Message: ";
+    char footer[] = "[pending]\n";
+#endif
     char recvbuffer[1024];
     while ((len = recv(pipe->fd_send, recvbuffer, 1000, 0)) > 0) {
-        for (size_t idx = 0, prev = 0; idx < len; ++idx) {
+        size_t prev = 0;
+        for (size_t idx = 0; idx < len; ++idx) {
             if (recvbuffer[idx] == '\n') {
-                char tmp = recvbuffer[idx+1];
-                recvbuffer[idx+1] = '\0';
-                send(pipe->fd_recv, header, 9, 0);
-                send(pipe->fd_recv, recvbuffer + prev, idx - prev + 1, 0);
-                recvbuffer[idx+1] = tmp;
-
+                my_bulk_send(pipe->fd_recv, header, sizeof(header) - 1, 0);
+                my_bulk_send(pipe->fd_recv, recvbuffer + prev, idx - prev + 1, 0);
                 prev = idx + 1;
             }
+        }
+        if (prev != len) {
+            // message truncated because of stream transfer
+            // there is no way to know if this message is lower half of another
+            my_bulk_send(pipe->fd_recv, header, sizeof(header) - 1, 0);
+            my_bulk_send(pipe->fd_recv, recvbuffer + prev, len - prev, 0);
+            my_bulk_send(pipe->fd_recv, footer, sizeof(footer) - 1, 0);
         }
     }
     return NULL;
