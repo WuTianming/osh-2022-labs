@@ -25,6 +25,7 @@ struct msg {
     }
 };
 
+// shared pointers provide thread-safe use_count counter
 // pthread_cond_t producer_ready[MAXN];
 queue<msg *> msg_queue[MAXN];
 pthread_mutex_t queue_mutexes[MAXN];
@@ -65,8 +66,6 @@ void *receive_msg(void *__id) {
         }
     }
     // getting 0 from recv() means client disconnect
-    close(fd_client[id]);
-    delete[] recvbuffer;
     online[id] = false;
     sem_post(&msg_ready[id]);   // releases the semaphore so that the broadcaster exits
     return NULL;
