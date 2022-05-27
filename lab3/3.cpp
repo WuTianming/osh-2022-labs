@@ -1,13 +1,15 @@
 #include <cstdio>
+#include <string>       // 摆烂了，zero copy 不可能的，string 满天飞预定……
 #include <cstring>
 #include <cstdlib>
 #include <queue>
-#include <list>
 #include <unistd.h>
+#include <fcntl.h>
+#include <signal.h>
 #include <sys/socket.h>
+#include <sys/select.h>
 #include <netinet/in.h>
-#include <pthread.h>
-#include <semaphore.h>
+#include <errno.h>
 
 using namespace std;
 
@@ -15,102 +17,90 @@ const int MAXN = 32;
 
 const char header[] = "Message: ";
 
-struct msg {
-    const char *data;
-    size_t len;
-    int counter;
-    msg(char *data, size_t len) : data(data), len(len), counter(0) {}
-    ~msg() {
-        delete[] data;
-    }
-};
-
-// shared pointers provide thread-safe use_count counter
-// pthread_cond_t producer_ready[MAXN];
-queue<msg *> msg_queue[MAXN];
-pthread_mutex_t queue_mutexes[MAXN];
-sem_t msg_ready[MAXN];
-pthread_t workers[MAXN][2];
 bool online[MAXN];
 int fd_client[MAXN];
 
-void my_bulk_send(int fd, const char *buf, size_t n, int flags) {
-    size_t sent = 0;
-    while (sent < n)
-        sent += send(fd, buf + sent, n - sent, flags);
+void set_nonblocking(int fd) {
+    fcntl(fd, F_SETFL, fcntl(fd, F_GETFL, 0) | O_NONBLOCK);
 }
 
-void *receive_msg(void *__id) {
-    unsigned long long id = (unsigned long long)__id;
+// for non-blocking send calls, message queues are still necessary
+queue<string> msg_queue[MAXN];          // already segmented with newline character
+size_t resume_pos[MAXN];
+ssize_t async_send(int id) {
+    // for non-blocking send, when the buffer is full send() returns EWOULDBLOCK
+    // and the send operation must be suspended until select() returns writable again
+    // this function deals with suspending & resuming the transaction
+    if (msg_queue[id].empty()) return 0;
+    size_t sent = resume_pos[id];
+    size_t n = msg_queue[id].front().length();
+    const char *buf = msg_queue[id].front().c_str();
+    while (sent < n) {
+        ssize_t ret = send(fd_client[id], buf + sent, n, 0);    // may cause SIGPIPE
+        if (ret <= 0) {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                // printf("client disconnected\n");
+                close(fd_client[id]);
+                return -1;
+            } else {
+                resume_pos[id] = sent;
+                return sent;
+            }
+        } else {
+            sent += ret;
+        }
+    }
+    resume_pos[id] = 0;
+    msg_queue[id].pop();
+    return sent;
+}
+
+char buffer[1024];
+
+void read_msg(int i) {
     ssize_t len;
-
-    const int BUFLEN = 1024;
-    char *recvbuffer = new char[BUFLEN];
-    list<msg *> buf_list;
-    while ((len = recv(fd_client[id], recvbuffer, 1000, 0)) > 0) {
-        msg *M = new msg(recvbuffer, len);
-        buf_list.push_back(M);
-        for (int i = 0; i < MAXN; i++)
-            if (online[i] && i != id) {
-                pthread_mutex_lock(&queue_mutexes[i]);
-                ++M->counter;
-                msg_queue[i].push(M);
-                pthread_mutex_unlock(&queue_mutexes[i]);
-                sem_post(&msg_ready[i]);
-            }
-        recvbuffer = new char[BUFLEN];
-        while (!buf_list.empty() && (*(buf_list.begin()))->counter == 0) {
-            msg *M = *(buf_list.begin());
-            delete M;
-            buf_list.pop_front();
-        }
-    }
-    // getting 0 from recv() means client disconnect
-    online[id] = false;
-    sem_post(&msg_ready[id]);   // releases the semaphore so that the broadcaster exits
-    return NULL;
-}
-
-void *broadcast_msg(void *__id) {
-    unsigned long long id = (unsigned long long)__id;
     while (true) {
-        sem_wait(&msg_ready[id]);
-        if (!online[id]) break;
-        if (msg_queue[id].empty()) continue;
-        msg *M = msg_queue[id].front();
-        size_t prev = 0;
-        for (size_t idx = 0; idx < M->len; ++idx) {
-            if (M->data[idx] == '\n') {
-                my_bulk_send(fd_client[id], header, sizeof(header) - 1, 0);
-                my_bulk_send(fd_client[id], M->data + prev, idx - prev + 1, 0);
-                prev = idx + 1;
+        if ((len = recv(fd_client[i], buffer, 1000, 0)) > 0) {
+            size_t prev = 0;
+            if (buffer[len - 1] != '\n') {
+                buffer[len] = '\n';
+                ++len;
             }
+            for (size_t idx = 0; idx < len; ++idx) {
+                if (buffer[idx] == '\n') {
+                    char tmp = buffer[idx + 1];
+                    buffer[idx + 1] = '\0';
+                    string msg = string(header) + (buffer + prev);
+                    buffer[idx + 1] = tmp;
+                    for (int j = 0; j < MAXN; j++) {
+                        if (online[j] && j != i) {
+                            msg_queue[j].push(msg);
+                        }
+                    }
+                    prev = idx + 1;
+                }
+            }
+        } else {
+            if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                close(fd_client[i]);
+                online[i] = false;
+            }
+            break;
         }
-        if (prev != M->len) {
-            my_bulk_send(fd_client[id], header, sizeof(header) - 1, 0);
-            my_bulk_send(fd_client[id], M->data + prev, M->len - prev, 0);
-        }
-        pthread_mutex_lock(&queue_mutexes[id]);
-        msg_queue[id].pop();
-        --M->counter;
-        pthread_mutex_unlock(&queue_mutexes[id]);
     }
-    while (!msg_queue[id].empty()) {
-        pthread_mutex_lock(&queue_mutexes[id]);
-        msg_queue[id].pop();
-        --msg_queue[id].front()->counter;
-        pthread_mutex_unlock(&queue_mutexes[id]);
-    }
-    return NULL;
 }
 
 int main(int argc, char **argv) {
+    signal(SIGPIPE, SIG_IGN);
+
     int port = atoi(argv[1]);
     int fd;
     if ((fd = socket(AF_INET, SOCK_STREAM, 0)) == 0) {
         perror("socket");
         return 1;
     }
+    // need the listening socket to be non-blocking
+    set_nonblocking(fd);
     struct sockaddr_in addr;
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = INADDR_ANY;
@@ -126,30 +116,49 @@ int main(int argc, char **argv) {
     }
     const char reject[] = "cannot accept more connections, sorry.\n";
 
-    for (int i = 0; i < MAXN; i++)
-        pthread_mutex_init(&queue_mutexes[i], NULL);
-    for (int i = 0; i < MAXN; i++)
-        sem_init(&msg_ready[i], 0, 0);
+    fd_set readable, writable;
 
     while (true) {
-        // accept new connections and launch new threads
-        int fd_tmp = accept(fd, NULL, NULL);
-        bool served = false;
+        FD_ZERO(&readable);
+        FD_ZERO(&writable);
+        FD_SET(fd, &readable);
+        int max_fd = fd;
         for (int i = 0; i < MAXN; i++) {
-            if (!online[i]) {
-                fd_client[i] = fd_tmp;
-                online[i] = true;
-                pthread_create(&workers[i][1], NULL, broadcast_msg, (void *)i);
-                pthread_detach(workers[i][1]);
-                pthread_create(&workers[i][0], NULL, receive_msg, (void *)i);
-                pthread_detach(workers[i][0]);
-                served = true;
-                break;
+            if (online[i]) {
+                max_fd = max(max_fd, fd_client[i]);
+                FD_SET(fd_client[i], &readable);
+                FD_SET(fd_client[i], &writable);
             }
         }
-        if (!served) {
-            my_bulk_send(fd_tmp, reject, sizeof(reject) - 1, 0);
-            close(fd_tmp);
+        if (select(max_fd + 1, &readable, &writable, NULL, NULL) > 0) {
+            if (FD_ISSET(fd, &readable)) {
+                // new connection
+                int fd_tmp = accept(fd, NULL, NULL);
+                set_nonblocking(fd_tmp);
+                bool served = false;
+                for (int i = 0; i < MAXN; i++) {
+                    if (!online[i]) {
+                        fd_client[i] = fd_tmp;
+                        online[i] = true;
+                        served = true;
+                        break;
+                    }
+                }
+                if (!served) {
+                    // send(fd_tmp, reject, sizeof(reject) - 1, 0);
+                    close(fd_tmp);
+                }
+            }
+            for (int i = 0; i < MAXN; i++) {
+                if (FD_ISSET(fd_client[i], &writable)) {
+                    while (async_send(i) > 0);
+                }
+                if (FD_ISSET(fd_client[i], &readable)) {
+                    read_msg(i);
+                }
+            }
+        } else {
+            break;
         }
     }
     return 0;
