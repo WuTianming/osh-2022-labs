@@ -68,15 +68,33 @@ void add_send_request(struct io_uring *ring, int client_id, char *buf, int len) 
 const char *header = "Message: ";
 
 void broadcast_messages(struct io_uring *ring, struct req_tag *orig) {
-    char *buf = malloc(orig->len + 10);
-    strcpy(buf, header);
-    strncat(buf, orig->buf, orig->len);
-    for (int i = 0; i < MAXN; i++) {
-        if (i == orig->client_id || !online[i]) continue;
-        char *sendbuf = strdup(buf);
-        add_send_request(ring, i, sendbuf, orig->len+9);
+    int prev = 0;
+    for (int i = 0; i < orig->len; i++)
+        if (orig->buf[i] == '\n') {
+            int len = i - prev + 1;
+            char *buf = malloc(len + 10);
+            strcpy(buf, header);
+            strncpy(buf + 9, orig->buf + prev, len);
+            for (int i = 0; i < MAXN; i++) {
+                if (i == orig->client_id || !online[i]) continue;
+                char *sendbuf = strndup(buf, len + 9);
+                add_send_request(ring, i, sendbuf, len + 9);
+            }
+            free(buf);
+            prev = i + 1;
+        }
+    if (prev != orig->len) {
+        int len = orig->len - prev;
+        char *buf = malloc(len + 10);
+        strcpy(buf, header);
+        strncpy(buf + 9, orig->buf, len);
+        for (int i = 0; i < MAXN; i++) {
+            if (i == orig->client_id || !online[i]) continue;
+            char *sendbuf = strndup(buf, len + 9);
+            add_send_request(ring, i, sendbuf, len + 9);
+        }
+        free(buf);
     }
-    free(buf);
 }
 
 int main(int argc, char **argv) {
