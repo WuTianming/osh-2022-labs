@@ -4,8 +4,6 @@
 #include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
-#include <sys/stat.h>
-#include <sys/ioctl.h>
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <liburing.h>
