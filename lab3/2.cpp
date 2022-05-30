@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
         perror("bind");
         return 1;
     }
-    if (listen(fd, 2)) {
+    if (listen(fd, 32)) {
         perror("listen");
         return 1;
     }
